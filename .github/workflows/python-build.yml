@@ -12,6 +12,9 @@ jobs:
   print-context:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Print Environment Variables
         # see more contexts: https://docs.github.com/en/actions/learn-github-actions/contexts#github-context
         run: |
@@ -22,10 +25,14 @@ jobs:
           echo "GitHub run_ID: ${{ github.run_id }}"
           echo "GitHub event_name: ${{ github.event_name }}"
           echo "GitHub ref: ${{ github.ref }}"
+          echo "Github head_ref ${{ github.head_ref }}"
           echo "GitHub ref_type: ${{ github.ref_type }}"
           echo "GitHub ref_name: ${{ github.ref_name }}"
+          branch=$(git branch -r --contains ${{ github.ref }} --format "%(refname:lstrip=3)")
+          echo "scripted branch: ${branch}"
+          echo "GitHub base branch of tag: ${{ github.event.base_ref }}"
           echo "GitHub sha: ${{ github.sha }}"
-  
+          echo "GitHub message: ${{ github.event.head_commit.message }}"
       
   build:
     name: Build distribution 📦

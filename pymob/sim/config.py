@@ -1,50 +1,75 @@
 import os
 import re
 import sys
-from dataclasses import dataclass
-from glob import glob
+from ast import literal_eval as make_tuple
 import configparser
 import warnings
 import importlib
-import logging
-import json
 import multiprocessing as mp
-from typing import List, Optional, Union, Dict, Literal, Callable
+from typing import List, Optional, Union, Dict, Literal, Callable, Tuple, TypedDict, Any
 from typing_extensions import Annotated
 from types import ModuleType
 import tempfile
 
 import numpy as np
+import xarray as xr
 from numpy.typing import ArrayLike
 
 from pydantic import (
     BaseModel, Field, computed_field, field_validator, model_validator, 
-    ConfigDict, TypeAdapter, ValidationError
+    ConfigDict, TypeAdapter, ValidationError, validator
 )
 from pydantic.functional_validators import BeforeValidator, AfterValidator
 from pydantic.functional_serializers import PlainSerializer
 
 from pymob.utils.store_file import scenario_file, converters
+from pymob.sim.parameters import Param, NumericArray, OptionRV
+# this loads at the import of the module
+default_path = sys.path.copy()
+
+# class FloatParam(BaseModel):
+#     name: Optional[str] = None
+#     value: float = 0.0
+#     min: Optional[float] = None
+#     max: Optional[float] = None
+#     step: Optional[float] = None
+#     prior: Optional[str] = None
+#     free: bool = True
 
 
-class FloatParam(BaseModel):
-    name: Optional[str] = None
-    value: float = 0.0
-    min: Optional[float] = None
-    max: Optional[float] = None
-    step: Optional[float] = None
-    prior: Optional[str] = None
-    free: bool = True
+# class ArrayParam(BaseModel):
+#     name: Optional[str] = None
+#     value: List[float] = [0.0]
+#     min: Optional[List[float]] = None
+#     max: Optional[List[float]] = None
+#     step: Optional[List[float]] = None
+#     prior: Optional[str] = None
+#     free: bool = True
 
+class PymobModel(BaseModel):
+    def __getitem__(self, key: str):
+        """Allow getting attribute by key (like a dict)"""
+        return getattr(self, key)
 
-class ArrayParam(BaseModel):
-    name: Optional[str] = None
-    value: List[float] = [0.0]
-    min: Optional[List[float]] = None
-    max: Optional[List[float]] = None
-    step: Optional[List[float]] = None
-    prior: Optional[str] = None
-    free: bool = True
+    def __setitem__(self, key: str, value):
+        """Allow setting attribute by key (like a dict), with validation"""
+        if key not in self.__annotations__:
+            raise KeyError(f"Key '{key}' not found")
+
+        # Set the value to the attribute
+        setattr(self, key, value)
+
+        # Trigger Pydantic validation, like when setting the attribute directly
+        try:
+            # Re-validate the model instance after setting the value
+            self.__class__.parse_obj(self.dict())
+        except ValidationError as e:
+            raise ValueError(f"Validation failed: {e}")
+
+class ModelParameterDict(TypedDict):
+    parameters: Dict[str, float|str|int]
+    y0: xr.Dataset
+    x_in: xr.Dataset
 
 class DataVariable(BaseModel):
     """Describe a data variable
@@ -65,6 +90,9 @@ class DataVariable(BaseModel):
         Defaults to 'nan', which sets the maximum to the maximum of the 
         observations
 
+    observed: bool
+        If the data-variable was observed or not. Defaults to True
+
     dimensions_evaluator: List[str]
         Specifies the dimensions and their order returned by the evaluator.
         This is necessary to bring observations and results together, if for some
@@ -76,9 +104,14 @@ class DataVariable(BaseModel):
     None
 
     """
+    model_config = ConfigDict(
+        validate_assignment=True,
+        extra="forbid"
+    )
     dimensions: List[str]
     min: float = np.nan
     max: float = np.nan
+    observed: bool = True
     dimensions_evaluator: Optional[List[str]] = None
 
     @model_validator(mode="after")
@@ -142,6 +175,10 @@ def string_to_list(option: Union[List, str]) -> List:
         return [i.strip() for i in option.split(" ")]
 
 
+def string_to_tuple(option: Union[List, str]) -> Tuple:
+    return tuple(string_to_list(option))
+
+
 def string_to_dict(
         option: Union[Dict[str,str|float|int|List[float|int|str]], str]
     ) -> Dict[str,str|float|int|List[float|int|str]]:
@@ -158,24 +195,35 @@ def string_to_dict(
             parsed = False
             if not parsed:
                 try:
-                    parsed_value = TypeAdapter(List[float]).validate_json(v)
+                    parsed_value = TypeAdapter(float).validate_json(v)
                     parsed = True
                 except ValidationError:
                     pass
 
             if not parsed:
                 try:
-                    parsed_value = TypeAdapter(float).validate_json(v)
+                    # v_ = np.array(ast.literal_eval(v))
+                    # _cfg = ConfigDict(arbitrary_types_allowed=True)
+                    parsed_value = TypeAdapter(NumericArray).validate_json(v)
                     parsed = True
-                except ValidationError:
+                except ValueError:
                     pass
 
-            if not parsed and  "[" in v and "]" in v:
+            if not parsed and v[0] == "(" and v[-1] == ")":
+                try:
+                    parsed_value = make_tuple(v)
+                    parsed = True
+                except ValueError:
+                    pass
+
+            # TODO: This expression seems to be wrong, but it causes no errors
+            if not parsed and  v[0]=="[" and v[-1]=="]":
                 try:
                     v_ = v.strip("[]").split(",")
                     # remove double quotes
                     v_ = [re.sub(r'^"|"$', '', s) for s in v_]
                     v_ = [re.sub(r"^'|'$", '', s) for s in v_]
+                    v_ = [v_i for v_i in v_ if v_i != ""]
                     parsed_value = TypeAdapter(List[str]).validate_python(v_)
                     parsed = True
                 except ValidationError:
@@ -189,17 +237,13 @@ def string_to_dict(
         return retdict
 
 
-def string_to_param(option:str|FloatParam|ArrayParam) -> FloatParam|ArrayParam:
-    if isinstance(option, FloatParam|ArrayParam):
+def string_to_param(option:str|Param) -> Param:
+    if isinstance(option, Param):
         return option
     else:
         param_dict = string_to_dict(option)
-        if isinstance(param_dict.get("value"), float):
-            return FloatParam.model_validate(param_dict, strict=False)
+        return Param.model_validate(param_dict, strict=False)
         
-        else:
-            return ArrayParam.model_validate(param_dict, strict=False)
-    
 
 def string_to_datavar(option:str|DataVariable) -> DataVariable:
     if isinstance(option, DataVariable):
@@ -208,18 +252,25 @@ def string_to_datavar(option:str|DataVariable) -> DataVariable:
         param_dict = string_to_dict(option)
         return DataVariable.model_validate(param_dict, strict=False)
         
-    
 
-def dict_to_string(dct: Dict):
-    return " ".join([f"{k}={v}".replace(" ", "") for k, v in dct.items()]).replace("'", "")
+def dict_to_string(dct: Dict, replace_whitespace=""):
+    string_items = []
+    for k, v in dct.items():
+        if isinstance(v, np.ndarray):
+            v = v.tolist()
+
+        expr = f"{k}={v}".replace(" ", replace_whitespace)
+        string_items.append(expr)
+
+    return " ".join(string_items)
 
 
 def list_to_string(lst: List):
     return " ".join([str(l) for l in lst])
 
 
-def param_to_string(prm: ArrayParam|FloatParam):
-    return dict_to_string(prm.model_dump(exclude_none=True))
+def param_to_string(prm: Param):
+    return dict_to_string(prm.model_dump(exclude_none=True, mode="json"))
 
 def datavar_to_string(prm: DataVariable):
     return dict_to_string(prm.model_dump(exclude_none=True))
@@ -260,6 +311,11 @@ OptionListStr = Annotated[
     serialize_list_to_string
 ]
 
+OptionTupleStr = Annotated[
+    Tuple[str, ...], 
+    BeforeValidator(string_to_tuple), 
+    serialize_list_to_string
+]
 
 OptionDictStr = Annotated[
     Dict[str,str|float|int|List[float|int]], 
@@ -274,20 +330,20 @@ OptionDataVariable = Annotated[
 ]
 
 OptionParam = Annotated[
-    FloatParam|ArrayParam, 
+    Param, 
     BeforeValidator(string_to_param), 
     serialize_param_to_string
 ]
 
 
-OptionListFloat = Annotated[
-    List[float], 
-    BeforeValidator(string_to_list), 
-    serialize_list_to_string
-]
+# OptionListFloat = Annotated[
+#     List[float], 
+#     BeforeValidator(string_to_list), 
+#     serialize_list_to_string
+# ]
 
         
-class Casestudy(BaseModel):
+class Casestudy(PymobModel):
     model_config = {"validate_assignment" : True}
     init_root: str = Field(default=os.getcwd(), exclude=True)
     root: str = "."
@@ -301,7 +357,7 @@ class Casestudy(BaseModel):
     output: Optional[str] = None
     data: Optional[str] = None
 
-    observations: OptionListStr = []
+    observations: Optional[str] = None
     
     logging: str = "DEBUG"
     logfile: Optional[str] = None
@@ -352,12 +408,22 @@ class Casestudy(BaseModel):
         
     @property
     def scenario_path(self):
-        return os.path.join(
-            os.path.relpath(self.package), 
-            os.path.relpath(self.name),
-            "scenarios", 
-            self.scenario
-        )
+        package_path = os.path.basename(os.path.abspath(self.package))
+        if package_path == self.name:
+            # if the package path is identical to the case study path, then 
+            # the scenario is directly located in the package.
+            return os.path.join(
+                os.path.relpath(self.package), 
+                "scenarios", 
+                self.scenario
+            )
+        else:
+            return os.path.join(
+                os.path.relpath(self.package), 
+                os.path.relpath(self.name),
+                "scenarios", 
+                self.scenario
+            )
     
     @field_validator("root", mode="after")
     def set_root(cls, new_value, info, **kwargs):
@@ -391,7 +457,7 @@ class Casestudy(BaseModel):
 
 
 
-class Simulation(BaseModel):
+class Simulation(PymobModel):
     model_config = {"validate_assignment" : True, "extra": "allow"}
 
     model: Optional[str] = Field(default=None, validate_default=True, description="The deterministic model")
@@ -403,18 +469,38 @@ class Simulation(BaseModel):
     input_files: OptionListStr = []
     # data_variables: OptionListStr = []
     n_ode_states: int = -1
-    replicated: bool = False
-    modeltype: Literal["stochastic", "deterministic"] = "stochastic"
+    batch_dimension: str = "batch_id"
+    x_dimension: str = "time"
+    modeltype: Literal["stochastic", "deterministic"] = "deterministic"
     solver_post_processing: Optional[str] = Field(default=None, validate_default=True)
     seed: Annotated[int, to_str] = 1
 
-class Datastructure(BaseModel):
+class Datastructure(PymobModel):
     __pydantic_extra__: Dict[str,OptionDataVariable]
     model_config = ConfigDict(extra="allow", validate_assignment=True)
+
+    def remove(self, key) -> None:
+        """Removes a data variable from the data structure"""
+        if key not in self.__pydantic_extra__:
+            warnings.warn(
+                f"'{key}' is not a data-variable. Data variables are: "
+                f"{self.data_variables}."
+            )
+            return
+        
+        deleted_var = self.__pydantic_extra__.pop(key)
+        print(f"Deleted '{key}' DataVariable({deleted_var}).")
+
+    def __getitem__(self, key):
+        return self.__pydantic_extra__[key]
 
     @property
     def data_variables(self) -> List[str]:
         return [k for k in self.__pydantic_extra__.keys()]
+    
+    @property
+    def observed_data_variables(self) -> List[str]:
+        return [k for k, v in self.__pydantic_extra__.items() if v.observed]
     
     @property
     def dimensions(self) -> List[str]:
@@ -438,6 +524,11 @@ class Datastructure(BaseModel):
     @property
     def dimdict(self) -> Dict[str, List[str]]:
         return {k: v.dimensions for k, v in self.__pydantic_extra__.items()}
+
+    @property
+    def observed_dimdict(self) -> Dict[str, List[str]]:
+        return {k: v.dimensions for k, v in self.__pydantic_extra__.items() if v.observed}
+
 
     @property
     def var_dim_mapper(self) -> Dict[str, List[str]]:
@@ -482,19 +573,46 @@ class Datastructure(BaseModel):
     def data_variables_max(self):
         return [v.max for v in self.__pydantic_extra__.values()]
 
+    @property
+    def observed_data_variables_min(self):
+        return [v.min for v in self.__pydantic_extra__.values() if v.observed]
 
-class Inference(BaseModel):
+    @property
+    def observed_data_variables_max(self):
+        return [v.max for v in self.__pydantic_extra__.values() if v.observed]
+
+class Solverbase(PymobModel):
+    model_config = ConfigDict(
+        validate_assignment=True, 
+        extra="forbid"
+    )
+    x_dim: str = "time"
+    exclude_kwargs_model: OptionTupleStr = ("t", "time", "x_in", "y", "x", "Y", "X")
+    exclude_kwargs_postprocessing: OptionTupleStr = ("t", "time", "interpolation", "results")
+
+class Jaxsolver(PymobModel):
+    diffrax_solver: str = "Dopri5"
+    rtol: float = 1e-6
+    atol: float = 1e-7
+    pcoeff: float = 0.0
+    icoeff: float = 1.0
+    dcoeff: float = 0.0
+    max_steps: int = int(1e5)
+    throw_exception: bool = True
+
+class Inference(PymobModel):
     model_config = {"validate_assignment" : True}
 
+    eps: float = 1e-8
     objective_function: str = "total_average"
     n_objectives: Annotated[int, to_str] = 1
     objective_names: OptionListStr = []
     backend: Optional[str] = None
     extra_vars: OptionListStr = []
     plot: Optional[str|Callable] = None
-    n_predictions: Annotated[int, to_str] = 1
+    n_predictions: Annotated[int, to_str] = 100
 
-class Multiprocessing(BaseModel):
+class Multiprocessing(PymobModel):
     _name = "multiprocessing"
     model_config = ConfigDict(validate_assignment=True, extra="ignore")
 
@@ -510,44 +628,96 @@ class Multiprocessing(BaseModel):
         else: 
             return cpu_set
         
-class Modelparameters(BaseModel):
+class Modelparameters(PymobModel):
     __pydantic_extra__: Dict[str,OptionParam]
     model_config = ConfigDict(extra="allow", validate_assignment=True)
 
     @property
+    def all(self) -> Dict[str,OptionParam]:
+        return self.__pydantic_extra__
+    
+    @all.setter
+    def all(self, value):
+        self.__pydantic_extra__ = value
+
+    @property
     def free(self) -> Dict[str,OptionParam]:
-        return {k:v for k, v in self.__pydantic_extra__.items() if v.free}
+        return {k:v for k, v in self.all.items() if v.free}
 
     @property
     def fixed(self) -> Dict[str,OptionParam]:
-        return {k:v for k, v in self.__pydantic_extra__.items() if not v.free}
-
-    @property
-    def all(self) -> Dict[str,OptionParam]:
-        return self.__pydantic_extra__
+        return {k:v for k, v in self.all.items() if not v.free}
 
     @property
     def n_free(self) -> int:
         return len(self.free)
     
     @property
-    def free_value_dict(self) -> Dict[str,float|List[float]]:
+    def free_value_dict(self) -> Dict[str,float|NumericArray]:
         return {k:v.value for k, v in self.free.items()}
     
     @property
-    def value_dict(self) -> Dict[str,float|List[float]]:
+    def fixed_value_dict(self) -> Dict[str,float|NumericArray]:
+        return {k:v.value for k, v in self.fixed.items()}
+    
+    @property
+    def value_dict(self) -> Dict[str,float|NumericArray]:
         return {k:v.value for k, v in self.all.items()}
     
+    @property
+    def dimensions(self) -> List[str]:
+        # TODO: Remove when dimensions is not accessed any longer
+        warnings.warn(
+            "Legacy method, will be deprecated soon. This works only if all "
+            "Data variables have the same dimension",
+            category=DeprecationWarning
+        )
+        dims = []
+        for k, v in self.all.items():
+            for d in v.dims:
+                if d not in dims:
+                    dims.append(d)
+        return dims
 
-class Errormodel(BaseModel):
-    __pydantic_extra__: Dict[str,str]
+    def remove(self, key) -> None:
+        """Removes a Parameter"""
+        if key not in self.all:
+            warnings.warn(
+                f"'{key}' is not a parameter. Parameters are: "
+                f"{list(self.all.keys())}."
+            )
+            return
+        
+        deleted_par = self.all.pop(key)
+        print(f"Deleted '{key}' Param({deleted_par}).")
+
+    def reorder(self, keys: List[str]):
+        """Reorders model parameters. This may be necessary for hierarchical 
+        models, because priors take draws from hyperpriors to parameterize their
+        distributions. Hence, they must be available earlier.
+
+        Parameters
+        ----------
+
+        keys : List[str]
+            A list of model parameters to sort the model_parameter dictionary 
+            after. If the keys list is smaller than the list of model parameters,
+            unlisted parameters will be appended to the keys list in order.
+        """
+        if len(keys) < len(self.all):
+            keys = keys + [k for k in self.all.keys() if k not in keys]
+            
+        self.all = {k:self.all[k] for k in keys} 
+
+class Errormodel(PymobModel):
+    __pydantic_extra__: Dict[str,OptionRV]
     model_config = ConfigDict(extra="allow", validate_assignment=True)
     
     @property
-    def all(self) -> Dict[str,str]:
+    def all(self) -> Dict[str,OptionRV]:
         return self.__pydantic_extra__
 
-class Pyabc(BaseModel):
+class Pyabc(PymobModel):
     model_config = {"validate_assignment" : True}
 
     sampler: str = "SingleCoreSampler"
@@ -559,7 +729,7 @@ class Pyabc(BaseModel):
     # database configuration
     database_path: str = f"{tempfile.gettempdir()}/pyabc.db"
 
-class Redis(BaseModel):
+class Redis(PymobModel):
     model_config = {"validate_assignment" : True, "protected_namespaces": ()}
 
     _name = "inference.pyabc.redis"
@@ -574,7 +744,7 @@ class Redis(BaseModel):
     model_id: Annotated[int, to_str] = Field(default=0, alias="eval.model_id")
 
 
-class Pymoo(BaseModel):
+class Pymoo(PymobModel):
     model_config = ConfigDict(validate_assignment=True, extra="ignore")
 
     algortihm: str = "UNSGA3"
@@ -585,22 +755,36 @@ class Pymoo(BaseModel):
     cvtol: Annotated[float, to_str] = 1e-7
     verbose: Annotated[bool, to_str] = True
     
-class Numpyro(BaseModel):
+class Numpyro(PymobModel):
     model_config = ConfigDict(validate_assignment=True, extra="ignore")
     user_defined_probability_model: Optional[str] = None
+    user_defined_error_model: Optional[str] = None
     user_defined_preprocessing: Optional[str] = None
     gaussian_base_distribution: bool = False
+    
+    # inference arguments
     kernel: str = "nuts"
     init_strategy: str = "init_to_uniform"
+     
+    # mcmc parameters
     chains: Annotated[int, to_str] = 1
     draws: Annotated[int, to_str] = 2000
     warmup: Annotated[int, to_str] = 1000
     thinning: Annotated[int, to_str] = 1
-    svi_iterations: Annotated[int, to_str] = 10_000
-    svi_learning_rate: Annotated[float, to_str] = 0.0001
+    
+    # nuts arguments
+    nuts_draws: Annotated[int, to_str] = 2000
+    nuts_step_size: Annotated[float, to_str] = 0.8
+    nuts_max_tree_depth: Annotated[int, to_str] = 10
+    nuts_target_accept_prob: Annotated[float, to_str] = 0.8
+    nuts_dense_mass: Annotated[bool, to_str] = True
+
+    # sa parameters
     sa_adapt_state_size: Optional[int] = None
 
-
+    # svi parameters
+    svi_iterations: Annotated[int, to_str] = 10_000
+    svi_learning_rate: Annotated[float, to_str] = 0.0001
 
 class Config(BaseModel):
     """Configuration manager for pymob."""
@@ -620,8 +804,14 @@ class Config(BaseModel):
                 converters=converters,
                 interpolation=interp
             )        
+            _config.optionxform = str # type: ignore
             _cfg_file_paths = _config.read(config)
-            _cfg_fp = _cfg_file_paths[0]
+            try:
+                _cfg_fp = _cfg_file_paths[0]
+            except IndexError:
+                raise FileNotFoundError(
+                    f"Config file: {config} could not be found."
+                ) 
         elif isinstance(config, configparser.ConfigParser):
             _config = config
         else:
@@ -629,6 +819,8 @@ class Config(BaseModel):
                 converters=converters,
                 interpolation=interp
             )
+            _config.optionxform = str # type: ignore
+
         # pass arguments to config
 
         if _cfg_fp is not None: _config.set("case-study", "settings_path", _cfg_fp)
@@ -641,6 +833,8 @@ class Config(BaseModel):
     case_study: Casestudy = Field(default=Casestudy(), alias="case-study")
     simulation: Simulation = Field(default=Simulation())
     data_structure: Datastructure = Field(default=Datastructure(), alias="data-structure") # type:ignore
+    solverbase: Solverbase = Field(default=Solverbase())
+    jaxsolver: Jaxsolver = Field(default=Jaxsolver(), alias="jax-solver")
     inference: Inference = Field(default=Inference())
     model_parameters: Modelparameters = Field(default=Modelparameters(), alias="model-parameters") #type: ignore
     error_model: Errormodel = Field(default=Errormodel(), alias="error-model") # type: ignore
@@ -654,18 +848,21 @@ class Config(BaseModel):
     def input_file_paths(self) -> list:
         paths_input_files = []
         for file in self.simulation.input_files:
-            fp = scenario_file(file, self.case_study.name, self.case_study.scenario)
+            fp = scenario_file(file, self.case_study.name, self.case_study.scenario, pkg_dir=self.case_study.package)
             paths_input_files.append(fp)
 
 
-        for file in self.case_study.observations:
+        file = self.case_study.observations
+        if file is None:
+            return paths_input_files
+        else:
             if not os.path.isabs(file):
                 fp = os.path.join(self.case_study.data_path, file)
             else:
                 fp = file
             paths_input_files.append(fp)
 
-        return paths_input_files
+            return paths_input_files
 
     def print(self):
         print("Simulation configuration", end="\n")
@@ -741,7 +938,7 @@ class Config(BaseModel):
             else:
                 print(f"No {directory} directory created.")
 
-    def import_casestudy_modules(self):
+    def import_casestudy_modules(self, reset_path=False):
         """
         this script handles the import of a case study without the typical 
         __init__.py file. It iterates through all .py files in the root directory
@@ -749,14 +946,64 @@ class Config(BaseModel):
         and imports them with import_module(...)
         """
 
+        # potential BUG: This is not safe. It is not guaranteed that the 
+        # case study has the same name as the package. But it might be in the future
+        package = self.case_study.name
+
+        if "-" in package or " " in package:
+            warnings.warn(
+                f"Case-study contained {package} contained unallowed "+
+                "characters: ['-', ' ']. "+
+                "The characters will be replaced with underscores ('_') for "+
+                "importing the package modules. " +
+                "In the future, the name of the case study should be the same as " +
+                "as the package where the modules are located. This name must not "
+                "contain hyphens ('-') or whitespace characters (' '),",
+                category=UserWarning
+            )
+            _package = package.replace("-", "_").replace(" ", "_")
+        else:
+            _package = package
+
+        spec = importlib.util.find_spec(_package)
+        if spec is not None:
+            for module in self.case_study.modules:
+                try:
+                    # TODO: Consider importing modules as a nested dictionary 
+                    # with the indexing key being the package. The package
+                    # cannot be derived from the class, if a method, that is 
+                    # executed on a lower level case-study, should target that 
+                    # a module belonging to the same package, because if the
+                    # object is used, it would resolve to the package of the
+                    # higher level case-study
+                    m = importlib.import_module(f"{_package}.{module}")
+                    self._modules.update({module: m})
+                except ModuleNotFoundError:
+                    warnings.warn(
+                        f"Module {module}.py not found in {_package}."
+                        f"Missing modules can lead to unexpected behavior. "
+                        f"Does your case study have a {module}.py file? "
+                        f"It should have the line `from PARENT_CASE_STUDY."
+                        f"{module} import *` to import all objects from "
+                        "the parent case study."
+                    )
+            return
+
+        # reset the path to avoid importing modules form case-studies used
+        # before in the same session
+        if reset_path:
+            # default path needs to be copied, otherwise it will be updated
+            # when setting sys.path
+            sys.path = default_path.copy()
+
         # append relevant paths to sys
         package = os.path.join(
             self.case_study.root, 
             self.case_study.package
         )
         if package not in sys.path:
-            sys.path.append(package)
-            print(f"Appended '{package}' to PATH")
+            sys.path.insert(0, package)
+            print(f"Inserted '{package}' in PATH at index=0")
     
         case_study = os.path.join(
             self.case_study.root, 
@@ -764,8 +1011,14 @@ class Config(BaseModel):
             self.case_study.name
         )
         if case_study not in sys.path:
-            sys.path.append(case_study)
-            print(f"Appended '{case_study}' to PATH")
+            sys.path.insert(0, case_study)
+            print(f"Inserted '{case_study}' in PATH at index=0")
+
+        for module in self.case_study.modules:
+            # remove modules of a different case study that might have been
+            # loaded in the same session.
+            if module in sys.modules:
+                _ = sys.modules.pop(module)
 
         for module in self.case_study.modules:
             try:
@@ -779,14 +1032,52 @@ class Config(BaseModel):
                     "Config 'config.case_study.modules = [...]'"
                 )
 
-    def import_simulation_from_case_study(self) -> Callable:
+    def import_simulation_from_case_study(self):
         try:
             Simulation = getattr(self._modules["sim"], self.case_study.simulation)
         except:
             raise ImportError(
-                f"Simulation class {self.case_study.simulation} "
+                f"Simulation class '{self.case_study.simulation}' "
                 "could not be found. Make sure the simulaton option is spelled "
                 "correctly or specify an class that exists in sim.py"
+                "If you are using pymob to work on different case-studies in "
+                "the same session, make sure to reset the path by "
+                "using `import_casestudy_modules(reset_path=True)`"
             )
         
         return Simulation
+
+    def set_option(self, section: str, option: str, value: str):
+        sect = getattr(self, section)
+        if isinstance(sect, Modelparameters):
+            if (value == "" or value == "None") and option in sect.all:
+                sect.remove(option)
+            elif (value == "" or value == "None") and option not in sect.all:
+                pass
+            else:
+                sect[option] = value
+        else:
+            sect[option] = value
+
+
+import click
+
+@click.command
+@click.option("--file", "-f", type=str, nargs=1, help="Path to the config file (usually in scenario/.../settings.cfg)")
+@click.option("--options", "-o", type=str, multiple=True, help="The option or options to configure. Combine sections and option like this 'simulation.seed=1' options that have spaces need to be wraped in quotes")
+def configure(file, options: Tuple[str, ...]):
+    config = Config(file)
+    for opt in options:
+        key, val = opt.split("=", 1)
+
+        section, option = key.strip(" ").rsplit(".", 1)
+
+        section = section.replace("-","_").replace(".","_")
+
+        if section == "jax_solver":
+            section == "jaxsolver"
+
+        value = val.strip(" ")
+        config.set_option(section, option, value)
+
+    config.save(file, force=True)

@@ -9,7 +9,29 @@ on:
 
 jobs:
   test-package:
-    uses: ./.github/workflows/python-test.yml
+    # uses: ./.github/workflows/python-test.yml
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Get Branch
+      run: |
+        branch=$(git branch -r --contains ${{ github.ref }} --format "%(refname:lstrip=3)")
+        echo "BRANCH=$branch" >> $GITHUB_ENV
+    - run: echo "Branch ${{ env.BRANCH }}"
+    - name: Download artifact
+      id: download-artifact
+      uses: dawidd6/action-download-artifact@v7
+      with:
+        workflow: python-test.yml
+        workflow_conclusion: success
+        branch: ${{ env.BRANCH }}
+        name: test-results
+        path: test_results/
+    - name: Check test result for the branch
+      id: check_test
+      run: pymob/bash/validate_test_results.sh test_results "${{ env.BRANCH }}"
   build-package:
     needs: test-package
     uses: ./.github/workflows/python-build.yml

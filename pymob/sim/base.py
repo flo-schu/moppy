@@ -46,7 +46,7 @@ def stack_variables(
 
     >>> import xarray as xr
     >>> from typing import List, Callable
-    >>> from pymob.sim.evaluators import stack_variables
+    >>> from pymob.sim.base import stack_variables
     >>> 
     >>> # Example usage:
     >>> an_xarray_dataset = xr.Dataset({
@@ -64,15 +64,15 @@ def stack_variables(
     ...     new_dim="letters",
     ... )
     >>> 
-    >>> print(result_dataset)
+    >>> result_dataset
     <xarray.Dataset>
-    Dimensions:  (letters: 3)
+    Dimensions:         (letters: 3)
     Coordinates:
-      * letters  (letters) <U1 'A' 'B' 'C'
+      * letters         (letters) <U1 'A' 'B' 'C'
     Data variables:
-        my_other_var_1  (float64) float64 4.0
-        my_other_var_2  (float64) float64 5.0
-        cext     (letters) float64 1.0 2.0 3.0
+        my_other_var_1  float64 4.0
+        my_other_var_2  float64 5.0
+        cext            (letters) float64 1.0 2.0 3.0
     """
     for v in variables:
         v_names = [pattern(v, c) for c in new_coordinates]

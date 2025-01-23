@@ -1,0 +1,8 @@
+[submodule "case_studies/tktd_rna_pulse"]
+	path = case_studies/tktd_rna_pulse
+	url = git@github.com:flo-schu/tktd_rna_pulse
+	branch = 0.4.0
+[submodule "case_studies/lotka_volterra_case_study"]
+	path = case_studies/lotka_volterra_case_study
+	url = git@github.com:flo-schu/lotka_volterra_case_study
+	branch = projects/hierarchical-modeling

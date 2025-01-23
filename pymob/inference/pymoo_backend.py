@@ -5,6 +5,7 @@ from sklearn.preprocessing import MinMaxScaler
 from matplotlib import pyplot as plt
 
 from pymob.simulation import SimulationBase
+from pymob.inference.base import InferenceBackend
 from pymob.utils.errors import import_optional_dependency
 
 extra = "'pymoo' dependencies can be installed with pip install pymob[pymoo]"

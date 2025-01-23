@@ -18,4 +18,5 @@ quickstart
 case_studies
 simulation
 parameter_inference
+diagnosing_problems
 ```

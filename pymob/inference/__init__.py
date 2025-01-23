@@ -1,5 +1,9 @@
 from pymob.utils.errors import import_optional_dependency
 
+from . import analysis
+from . import base
+from . import scipy_backend
+
 pyabc = import_optional_dependency("pyabc", errors="ignore")
 if pyabc is not None:
     from . import pyabc_backend
@@ -11,5 +15,4 @@ if pymoo is not None:
 numpyro = import_optional_dependency("numpyro", errors="ignore")
 if numpyro is not None:
     from . import numpyro_backend
-
-from . import analysis
+    from . import numpyro_dist_map

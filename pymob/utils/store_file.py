@@ -201,7 +201,7 @@ def prepare_casestudy(
     from my_module import prepare_casestudy
 
     # Example usage of prepare_casestudy function
-    config = prepare_casestudy(("test_case_study", "test_scenario"), "settings.cfg")
+    config = prepare_casestudy(("lotka_volterra_case_study", "test_scenario"), "settings.cfg")
 
     # Now you can access configuration settings
     print(config.get("case-study", "name"))

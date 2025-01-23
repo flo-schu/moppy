@@ -105,7 +105,7 @@ from pymob.utils.store_file import prepare_casestudy
 # In this example we have the following directory tree:
 # project_directory (working directory)
 #  ├─ case_studies
-#  │   ├─ test_case_study
+#  │   ├─ lotka_volterra_case_study
 #  │   │   ├─ scenarios
 #  │   │   │   ├─ test_scenario
 #  │   │   │   │   └─ settings.cfg
@@ -114,7 +114,7 @@ from pymob.utils.store_file import prepare_casestudy
 #  |   |   ├─ sim.py
 #
 config = prepare_casestudy(
-    case_study=("test_case_study", "test_scenario"), 
+    case_study=("lotka_volterra_case_study", "test_scenario"), 
     config_file="settings.cfg",
     pkg_dir="case_studies"
 )

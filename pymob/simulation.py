@@ -4,7 +4,7 @@ import copy
 import inspect
 import warnings
 import importlib
-from typing import Optional, List, Union, Literal, Any
+from typing import Optional, List, Union, Literal, Any, Tuple, Sequence, Mapping
 from types import ModuleType
 import configparser
 from functools import partial
@@ -12,19 +12,23 @@ import multiprocessing as mp
 from typing import Callable, Dict
 from multiprocessing.pool import ThreadPool, Pool
 import re
+from collections import OrderedDict
 
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 import xarray as xr
 import dpath as dp
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from toopy import param, benchmark
 
-from pymob.utils.config import lambdify_expression, lookup_args
+import pymob
+from pymob.utils.config import lambdify_expression, lookup_args, get_return_arguments
 from pymob.utils.errors import errormsg, import_optional_dependency
 from pymob.utils.store_file import scenario_file, parse_config_section
 from pymob.sim.evaluator import Evaluator, create_dataset_from_dict, create_dataset_from_numpy
 from pymob.sim.base import stack_variables
-from pymob.sim.config import Config, FloatParam, ArrayParam, ParameterDict, DataVariable
+from pymob.sim.config import Config, ParameterDict, DataVariable, Param, NumericArray
+from pymob.sim.plot import SimulationPlot
 
 config_deprecation = "Direct access of config options will be deprecated. Use `Simulation.config.OPTION` API instead"
 MODULES = ["sim", "mod", "prob", "data", "plot"]
@@ -90,23 +94,103 @@ def update_parameters_dict(config, x, parnames):
             )
     return config
 
-def get_return_arguments(func):
-    ode_model_source = inspect.getsource(func)
-    
-    # extracts last return statement of source
-    return_statement = ode_model_source.split("\n")[-2]
 
-    # extract arguments returned by ode_func
-    return_args = return_statement.split("return")[1]
-
-    # strip whitespace and separate by comma
-    return_args = return_args.replace(" ", "").split(",")
-
-    return return_args
 
 class SimulationBase:
-    model: Callable
-    solver: Callable
+    """
+    Construct a simulation directly to construct a new simulation instance, 
+    use it with a config file for modifying or playing with existing simulations
+    or use for subclassing.
+
+    Components
+    ----------
+
+    model : Callable
+        A python function that returns one or multiple numeric values or arrays
+        The number and dimensionality of the output must be specified in the
+        :class:`pymob.sim.config.Datastructure`, which takes 
+        :class:`pymob.sim.config.DataVariable` as input.
+    model_parameters : Dict['theta': Dict[str, float|Array], 'y0': xarray.Dataset, 'x_in': xarray.Dataset]
+        Model parameters is a dictionary containing 3 keys: 'theta' (parameters), 
+        'y0' (initial values), and 'x_in' (input that can be interpolated).
+        Only 'theta' is a mandatory component.
+        
+    
+    Direct use
+    ----------
+
+    In the direct use, {class}`pymob.simulation.SimulationBase` is instantiated
+    and the relevant model attributes are set. Each simulation needs these 
+    parameters
+    
+    >>> import xarray as xr
+    >>> from pymob import SimulationBase
+    >>> from pymob.examples import linear_model
+    >>> from pymob.sim.solvetools import solve_analytic_1d
+
+    Instantiate the model and assign the data. ALthough assigning data is
+    not mandatory, it makes setting up a model easier, because the coordinates,
+    and dimensions are simply taken from the observations dataset
+
+    >>> sim = SimulationBase()
+    >>> linreg, x, y, y_noise, parameters = linear_model(n=5)
+    >>> obs = xr.DataArray(y_noise, coords={"x": x}).to_dataset(name="y")
+    >>> sim.observations = obs
+    MinMaxScaler(variable=y, min=-4.654415807935214, max=5.905355866673117)
+
+    Parameterize the model    
+    
+    >>> sim.model = linreg
+    >>> sim.solver = solve_analytic_1d
+    >>> sim.config.model_parameters.a = Param(value=10, free=False)
+    >>> sim.config.model_parameters.b = Param(value=3, free=True , prior="normal(loc=0,scale=10)") # type:ignore
+    >>> sim.model_parameters["parameters"] = sim.config.model_parameters.value_dict
+
+    Run the model
+    
+    >>> sim.dispatch_constructor()
+    >>> evaluator = sim.dispatch(theta={"b":3})
+    >>> evaluator()
+    >>> evaluator.results
+    <xarray.Dataset>
+    Dimensions:  (x: 5)
+    Coordinates:
+      * x        (x) float64 -5.0 -2.5 0.0 2.5 5.0
+    Data variables:
+        y        (x) float64 -5.0 2.5 10.0 17.5 25.0
+
+    
+    Subclassing use
+    ---------------
+
+    Subclassing :class:`SimulationBase` makes sense if the Simulation is intended
+    to be used with configuration files
+
+    >>> class LotkaVolterraSimulation(SimulationBase):
+    ...     def initialize(self, input):
+    ...         self.observations = xr.load_dataset(os.path.join(self.data_path, self.config.case_study.observations))
+    ...         y0 = self.parse_input("y0", drop_dims=["time"])
+    ...         self.model_parameters["y0"] = y0
+    ...         self.model_parameters["parameters"] = self.config.model_parameters.value_dict
+    
+    .. :code-block: python
+
+       sim = LotkaVolterraSimulation(settings.cfg)
+       sim.setup()
+
+    :meth:`setup` calls initialize and a couple of other functions to set up the
+    simulation. Afterwards methods like :meth:`dispatch` can be used. The idea is
+    to automatize the regular setup steps for a simulation in the initialize 
+    method. The reason why :meth:`setup` is called explicitely and not implicitly
+    by the `__init__` method is to give the user the opportunity to change the 
+    configuration before initializing, such as the name of the scenario 
+    (`sim.config.case_study.scenario`), the results directory 
+    (`sim.config.case_study.output`) or any other configuration of the simulation
+
+    """
+    SimulationPlot = SimulationPlot
+    model: Optional[Callable] = None
+    solver: Optional[Callable] = None
     _mod: ModuleType
     _prob: ModuleType
     _data: ModuleType
@@ -124,6 +208,7 @@ class SimulationBase:
         self._observations: xr.Dataset = xr.Dataset()
         self._observations_copy: xr.Dataset = xr.Dataset()
         self._coordinates: Dict = {}
+        self._scaler = {}
 
         self._model_parameters: Dict[Literal["parameters","y0","x_in"],Any] =\
             ParameterDict(parameters={}, callback=self._on_params_updated)
@@ -143,12 +228,12 @@ class SimulationBase:
         # simulation
         # self.setup()
         
-    def setup(self):
+    def setup(self, **evaluator_kwargs):
         """Simulation setup routine, when the following methods have been 
         defined:
         
         coords = self.set_coordinates(input=self.input_file_paths)
-        self.coordinates = self.create_coordinates(coordinate_data=coords)
+        self.coordinates = self.create_coordinates()
         self.var_dim_mapper = self.create_dim_index()
         init-methods
         ------------
@@ -157,14 +242,13 @@ class SimulationBase:
 
         """
 
-        self.validate()
 
         self.load_modules()
 
         self.initialize(input=self.config.input_file_paths)
+        self.coordinates = self.create_coordinates()
+        self.validate()
         
-        # coords = self.set_coordinates(input=self.config.input_file_paths)
-        # self.coordinates = self.create_coordinates(coordinate_data=coords)
         self.config.create_directory(directory="results", force=True)
         self.config.create_directory(directory="scenario", force=True)
 
@@ -173,7 +257,7 @@ class SimulationBase:
             self.parameterize, 
             model_parameters=copy.deepcopy(dict(self.model_parameters))
         )
-        self.config.simulation.n_ode_states = self.infer_ode_states()
+        self.dispatch_constructor()
 
     @property
     def model_parameters(self) -> Dict[Literal["parameters","y0","x_in"],Any]:
@@ -241,20 +325,56 @@ class SimulationBase:
         if sum(tuple(self._observations_copy.sizes.values())) == 0:
             self._observations_copy = copy.deepcopy(value)
 
+        self.coordinates = self.create_coordinates()
+
+        unobserved_keys = [
+            k for k in self.config.data_structure.observed_data_variables 
+            if k not in self.observations
+        ]
+
+        if len(unobserved_keys) > 0:
+            raise KeyError(
+                f"{unobserved_keys} were not found in the observations."
+                f"Make sure any unobserved data variable is specified as "
+                "'DataVariable(..., observed=False)' or make sure the "
+                "observations include the data variable."
+            )
+
         self.create_data_scaler()
-        self.coordinates = self.set_coordinates(input=self.config.input_file_paths)
         
+    def save_observations(self, filename="observations.nc", force=False):
+        fp = os.path.join(self.data_path, filename)
+        if filename != self.config.case_study.observations:
+            self.config.case_study.observations = filename
+
+        if not os.path.exists(fp) or force:
+            self.observations.to_netcdf(fp)
+        else:
+            if input(f"Observations {fp} exist. Overwrite? [y/N]") == "y":
+                self.observations.to_netcdf(fp)
+
 
     @property
     def coordinates(self):
         return self._coordinates
 
     @coordinates.setter
-    def coordinates(self, value):
-        self._coordinates = self.create_coordinates(coordinate_data=value)
+    def coordinates(self, value: Dict[str, np.ndarray] | List[np.ndarray] | Tuple[np.ndarray]):
+        dims = self.config.data_structure.dimensions
+        if len(dims) != len(value):
+            raise AssertionError(
+                f"number of dimensions {dims} ({len(dims)}), must match "
+                f"the number of dimensions in the coordinate data "
+                f"{len(value)}."
+            )
+
+        if isinstance(value, (tuple, list)):
+            value = {dim: x_i for dim, x_i in zip(dims, value)}
+
+        self._coordinates = value
 
     @property
-    def free_model_parameters(self) -> List[FloatParam|ArrayParam]:
+    def free_model_parameters(self) -> List[Param]:
         # TODO: Remove when all method has been updated to the new config API
         warnings.warn(config_deprecation, DeprecationWarning)
         free_params = self.config.model_parameters.free.copy()
@@ -263,11 +383,11 @@ class SimulationBase:
         return list(free_params.values())
 
     @property
-    def fixed_model_parameters(self) -> Dict[str, FloatParam|ArrayParam]:
+    def fixed_model_parameters(self) -> Dict[str, Param]:
         return self.config.model_parameters.fixed
 
     @property
-    def all_model_parameters(self) -> Dict[str, FloatParam|ArrayParam]:
+    def all_model_parameters(self) -> Dict[str, Param]:
         return self.config.model_parameters.all
 
     def __repr__(self) -> str:
@@ -277,14 +397,47 @@ class SimulationBase:
         )
 
     def load_modules(self):
+        """Loads modules from cases studies. If the case study is a regular 
+        python package. It looks for the package associated with the Simulation 
+        class and imports the typical modules [data, mod, plot, prob, sim]
+
+        :meta private:
+        """
+        # test if the case study is installed as a package
+        package = self.__module__.split(".")[0]
+        spec = importlib.util.find_spec(package)
+        if spec is not None and package != "pymob":
+            for module in MODULES:
+                try:
+                    # TODO: Consider importing modules as a nested dictionary 
+                    # with the indexing key being the package. The package
+                    # cannot be derived from the class, if a method, that is 
+                    # executed on a lower level case-study, should target that 
+                    # a module belonging to the same package, because if the
+                    # object is used, it would resolve to the package of the
+                    # higher level case-study
+                    m = importlib.import_module(f"{package}.{module}")
+                    setattr(self, f"_{module}", m)
+                except ModuleNotFoundError:
+                    warnings.warn(
+                        f"Module {module}.py not found in {package}."
+                        f"Missing modules can lead to unexpected behavior. "
+                        f"Does your case study have a {module}.py file? "
+                        f"It should have the line `from PARENT_CASE_STUDY."
+                        f"{module} import *` to import all objects from "
+                        "the parent case study."
+                    )
+            return
+
+
         # append relevant paths to sys
         package = os.path.join(
             self.config.case_study.root, 
             self.config.case_study.package
         )
         if package not in sys.path:
-            sys.path.append(package)
-            print(f"Appended '{package}' to PATH")
+            sys.path.insert(0, package)
+            print(f"Inserted '{package}' into PATH at index=0")
     
         case_study = os.path.join(
             self.config.case_study.root, 
@@ -292,8 +445,8 @@ class SimulationBase:
             self.config.case_study.name
         )
         if case_study not in sys.path:
-            sys.path.append(case_study)
-            print(f"Appended '{case_study}' to PATH")
+            sys.path.insert(0, case_study)
+            print(f"Inserted '{case_study}' into PATH at index=0")
 
         for module in MODULES:
             try:
@@ -305,23 +458,21 @@ class SimulationBase:
                     f"Missing modules can lead to unexpected behavior."
                 )
 
+    def create_coordinates(self) -> Dict[str, np.ndarray]:
+        """
+        :meta private:
+        """
+        coordinates = {}
+        for dim in self.config.data_structure.dimensions:
+            if dim in self.observations:
+                coord = self.observations[dim].values
+            else:
+                # adds a dummy coordinate
+                coord = np.array([0])
 
+            coordinates.update({dim: coord})
 
-
-    def load_functions(self):
-        _model = self.config.simulation.model
-        if _model is not None:
-            self.model = getattr(self._mod, _model)
-
-        _solver = self.config.simulation.solver
-        if _solver is not None:
-            self.solver = getattr(self._mod, _solver)
-
-    def set_coordinates(self, input):
-        # TODO remove input statement. I think set_coordinates will no longer
-        # be necessary for pymob
-        dimensions = self.config.data_structure.dimensions
-        return [self.observations[dim].values for dim in dimensions]
+        return coordinates
 
     def reset_coordinate(self, dim:str):
         self.coordinates[dim] = self.observations[dim].values
@@ -330,7 +481,7 @@ class SimulationBase:
         self.observations[data_variable] = self._observations_copy[data_variable]
 
     def reset_all_coordinates(self):
-        self.coordinates = self.set_coordinates(input=self.config.input_file_paths)
+        self.coordinates = self.create_coordinates()
 
     def create_interpolated_coordinates(self, dim):
         """Combines coordinates from observations and from interpolation"""
@@ -358,8 +509,10 @@ class SimulationBase:
         @benchmark
         def run_bench():
             for i in range(n):
+                evaluator = self.dispatch(theta=self.model_parameter_dict, **kwargs)
                 evaluator(seed=self.RNG.integers(100))
-        
+                evaluator.results
+
         print(f"\nBenchmarking with {n} evaluations")
         print(f"=================================")
         run_bench()
@@ -389,58 +542,246 @@ class SimulationBase:
 
         return n_ode_states
         
-    def dispatch(self, theta, **evaluator_kwargs):
-        """Dispatch an evaluator, which will compute the model at parameters
-        (theta). Evaluators are advantageous, because they are easier serialized
-        than the whole simulation object. Comparison can then happen back in 
-        the simulation.
-
-        Theoretically, this could also be used to constrain coordinates etc, 
-        before evaluating.  
+    @staticmethod
+    def validate_model_input(model_input) -> OrderedDict[str, Sequence[float]]:
+        """Returns a copy of the model input. This means, the original model input
+        will not be overwritten by any action.
         """
-        model_parameters = self.parameterize(dict(theta)) #type: ignore
+        if isinstance(model_input, xr.Dataset):
+            model_input = {
+                k: dv.values for k, dv in model_input.data_vars.items()
+            }
+            return OrderedDict(model_input) # type: ignore
         
-        # TODO: make sure the evaluator has all arguments required for solving
-        # model
-        # TODO: Check if model is bound. If yes extract
-        if hasattr(self.solver, "__func__"):
-            solver = self.solver.__func__
-        else:
-            solver = self.solver
+        raise NotImplementedError(
+            f"Model input of type {type(model_input)} "
+            "is not implemented. Use an xr.Dataset"
+        )
 
-        if hasattr(self.model, "__func__"):
-            model = self.model.__func__
+    def subset_by_batch_dimension(self, data):
+        batch_dim = self.config.simulation.batch_dimension
+        if batch_dim not in self.coordinates:
+            return data
+        
+        if batch_dim not in data:
+            raise KeyError(
+                "Batch dimension not in input data"
+            )
+        mask = data[batch_dim].isin(self.coordinates[batch_dim])
+        return data.where(mask, drop=True)
+
+    @property
+    def coordinates_input_vars(self) -> Dict[str, Dict[str, Dict[str, NDArray]]]:
+        input_vars = ["x_in", "y0"]
+
+        # This is a function that could replace the below, to return always
+        # dictionaries for any possible input vars. Default: Empty dict
+        coordinates = {}
+        for k in input_vars:
+            if k in self.model_parameters:
+                dataset: xr.Dataset = self.model_parameters[k]
+                data_var_coords = {}
+                for var_name, var_data in dataset.data_vars.items():
+                    var_coords = {ck: cv.values for ck, cv in var_data.coords.items()}
+                    data_var_coords.update({var_name:var_coords})
+            else:
+                data_var_coords = {}
+
+            coordinates.update({k: data_var_coords})
+        return coordinates
+        # return {
+        #     k: {ck: cv.values for ck, cv in v.coords.items()} 
+        #     for k, v in self.model_parameters.items() 
+        #     if k in input_vars
+        # }
+
+    @property
+    def dims_input_vars(self) -> Dict[str, Dict[str, Tuple[str, ...]]]:
+        return {
+            kiv: {
+                k_var: tuple([k for k in v_var.keys()]) 
+                for k_var, v_var in viv.items()
+            } 
+            for kiv, viv in self.coordinates_input_vars.items()
+        }
+
+    @property
+    def coordinates_indices(self):
+        return {
+            idx_name: idx_val.coords[idx_name].values
+            for idx_name, idx_val in self.indices.items() 
+        }
+
+    @property
+    def parameter_dims(self) -> Dict[str, Tuple[str, ...]]:
+        return {
+            par_name: param.dims
+            for par_name, param in self.config.model_parameters.all.items() 
+        }
+
+    @property
+    def parameter_shapes(self) -> Dict[str, Tuple[int, ...]]:
+        return {
+            par_name: tuple([self.dimension_sizes[d] for d in param.dims])
+            for par_name, param in self.config.model_parameters.all.items() 
+        }
+
+    def dispatch_constructor(self, **evaluator_kwargs):
+        """Construct the dispatcher and pass everything to the evaluator that is 
+        static."""
+
+        if self.model is None:
+            if self.config.simulation.model:
+                if not hasattr(self, "_mod"):
+                    self.load_modules()
+                model = getattr(self._mod, self.config.simulation.model)
+                self.model = model
+            else: 
+                raise ValueError(
+                    f"A model was not provided as a callable function nor was "
+                    "it specified in 'config.simulation.model', please specify "
+                    "Any of the two."
+                )
         else:
             model = self.model
+
+        self.n_ode_states = self.infer_ode_states()
+
+        if self.solver is None:
+            if self.config.simulation.solver:
+                if not hasattr(self, "_mod"):
+                    self.load_modules()
+                try:
+                    solver = getattr(self._mod, self.config.simulation.solver)
+                except AttributeError:
+                    try:
+                        solver = getattr(pymob.solvers, self.config.simulation.solver)
+                    except AttributeError:
+                        raise AttributeError(
+                            f"The solver {self.config.simulation.solver} "
+                            f"could not be found in {self._mod} or {pymob.solvers} "
+                            f"Define your own solver or callable or select an "
+                            "implemented solver (e.g. JaxSolver)."
+                        )
+                self.solver = solver
+            else: 
+                raise ValueError(
+                    f"A solver was not provided directly to 'sim.solver' nor was "
+                    "it specified in 'config.simulation.model', please specify "
+                    "Any of the two."
+                )
+        else:
+            solver = self.solver
         
         if self.solver_post_processing is not None:
             # TODO: Handle similar to solver and model
             post_processing = getattr(self._mod, self.solver_post_processing)
         else:
-            post_processing = None
+            post_processing = lambda results, time, interpolation: results
 
         stochastic = self.config.simulation.modeltype
             
-        evaluator = Evaluator(
+        solver_options = {}
+        if isinstance(solver, type):
+            solver_classes = [solver] + [c for c in solver.__mro__ if c not in [solver, object]]
+
+            for sc in solver_classes:
+                try:
+                    solver_options = getattr(self.config, sc.__name__.lower())
+                    solver_options = solver_options.model_dump()
+                    break
+                except AttributeError:
+                    continue
+
+        self.evaluator = Evaluator(
             model=model,
             solver=solver,
-            parameters=model_parameters,
+            parameter_dims=self.parameter_dims,
             dimensions=self.dimensions,
+            dimension_sizes=self.dimension_sizes,
             n_ode_states=self.config.simulation.n_ode_states,
             var_dim_mapper=self.var_dim_mapper,
             data_structure=self.data_structure,
+            data_structure_and_dimensionality=self.data_structure_and_dimensionality,
             data_variables=self.data_variables,
             coordinates=self.coordinates,
+            coordinates_input_vars=self.coordinates_input_vars,
+            dims_input_vars=self.dims_input_vars,
+            coordinates_indices=self.coordinates_indices,
             # TODO: pass the whole simulation settings section
             stochastic=True if stochastic == "stochastic" else False,
             indices=self.indices,
             post_processing=post_processing,
+            batch_dimension=self.config.simulation.batch_dimension,
+            solver_options=solver_options,
             **evaluator_kwargs
         )
 
+        # return evaluator
+
+    def dispatch(
+            self, 
+            theta: Mapping[str, float|NumericArray|Sequence[float]] = {}, 
+            y0: Mapping[str, float|NumericArray|Sequence[float]] = {}, 
+            x_in: Mapping[str, float|NumericArray|Sequence[float]] = {}, 
+        ):
+        """Dispatch an evaluator, which will compute the model for the parameters
+        (theta), starting values (y0) and model input (x_in). 
+        
+        Evaluators are advantageous, because they are easier serialized
+        than the whole simulation object. Comparison can then happen back in 
+        the simulation.
+
+        In addition, evaluators can be dispatched and seeded and evaluated in
+        parallel, because they are decoupled from the simulation object
+
+        Parameters
+        ----------
+
+        theta : Dict[float|Sequence[float]]
+            Dictionary of model parameters that should be changed for dispatch.
+            Unspecified model parameters will assume the default values, 
+            specified under config.model_parameters.NAME.value
+
+        y0 : Dict[float|Sequence[float]]
+            Dictionary of initial values that should be changed for dispatch.
+        
+        x_in : Dict[float|Sequence[float]]
+            Dictionary of model input values that should be changed for dispatch.
+        
+        """
+        model_parameters = self.parameterize(dict(theta)) #type: ignore
+        # can be initialized
+        if "y0" in model_parameters:
+            y0_ = self.subset_by_batch_dimension(model_parameters["y0"])
+            y0_ = self.validate_model_input(y0_)
+            
+            # update keys passed to y0
+            y0_.update(y0)
+            model_parameters["y0"] = y0_
+        else:
+            model_parameters["y0"] = OrderedDict({})
+        
+        if "x_in" in model_parameters:
+            x_in_ = self.subset_by_batch_dimension(model_parameters["x_in"])
+            x_in_ = self.validate_model_input(x_in_)
+
+            # update keys passed to x_in
+            x_in_.update(x_in)
+            model_parameters["x_in"] = x_in_
+        else:
+            model_parameters["x_in"] = OrderedDict({})
+        
+        evaluator = self.evaluator.spawn()
+        evaluator.parameters = model_parameters
         return evaluator
 
-    def parse_input(self, input:Literal["y0", "x_in"], reference_data, drop_dims=["time"]):
+    def parse_input(
+        self, 
+        input : Literal["y0", "x_in"], 
+        reference_data: Optional[xr.Dataset]=None, 
+        drop_dims: List[str]=[]
+    ) -> xr.Dataset:
         """Parses a config string e.g. y=Array([0]) or a=b to a numpy array 
         and looks up symbols in the elements of data, where data items are
         key:value pairs of a dictionary, xarray items or anything of this form
@@ -449,13 +790,25 @@ class SimulationBase:
         vations that have not been dropped. Input refers to the argument in
         the config file. 
 
-        This method is useful to prepare y0s from observations or to broadcast
+        This method is useful to prepare y0s or x_in from observations or to broadcast
         starting values along batch dimensions.
+
+        Parameters
+        ----------
+
+        input : Literal["y0", "x_in"]
+            The key in config.simulation that contains the input mapping. The
+            key must be contained in the data structure, otherwise an error
+            will be raised. This is done to make sure there is no ambiguity in
+            the applied dimensional broadcasting.
+            
+            Example:
+            `sim.config.simulation.y0 = ['A=Array([0])', 'B=C']` 
+            `reference_data = xr.Dataset()`
+
+        reference_data : Optional[xr.Dataset]
+    
         """
-        # parse dims and coords
-        input_dims = {k:v for k, v in reference_data.dims.items() if k not in drop_dims}
-        input_coords = {k:reference_data.coords[k] for k in input_dims}
-        
         if input == "y0":
             input_list = self.config.simulation.y0
         elif input == "x_in":
@@ -467,20 +820,84 @@ class SimulationBase:
         for input_expression in input_list:
             key, expr = input_expression.split("=")
             
+            if key not in self.config.data_structure.all:
+                raise KeyError(
+                    f"'{key}' was not found in the DataStructure and "
+                    "reference_data. "
+                    f"Set 'sim.config.data_structure.{key} = DataVariable(...) " 
+                    f"Or Specify reference_data that contains '{key}' " 
+                )
+                
+
             func, args = lambdify_expression(expr)
-
+            if len(args) > 0 and reference_data is None:
+                raise AssertionError(
+                    f"Pymob is trying to look up the values of {args} in the "+
+                    "reference data, but `reference_data=None`. Provide "+
+                    "reference data if necessary and check if the right input "+
+                    f"key is used (currently: `input='{input}'`)."
+                )
             kwargs = lookup_args(args, reference_data)
-
             value = func(**kwargs)
-
-            if not isinstance(value, xr.DataArray):
-                assert value.shape != tuple(input_dims.values())
-                value = np.broadcast_to(value, tuple(input_dims.values()))
-                value = xr.DataArray(value, coords=input_coords)
+            
+            # parse dims and coords
+            if reference_data is None:
+                try:
+                    input_dims = {
+                        k: len(self.coordinates[k]) for k 
+                        in self.config.data_structure.all[key].dimensions
+                        if k not in drop_dims
+                    }
+                except KeyError as err:
+                    missing_dim, = err.args
+                    if missing_dim not in self.coordinates:
+                        raise KeyError(
+                            f"Pymob cannot find the key '{missing_dim}' in "+
+                            f"the coordinates: `sim.coordinates = {self.coordinates}`"
+                        )
+                    else:
+                        raise KeyError(
+                            f"Pymob cannot find the key '{missing_dim}' in "+
+                            f"the simulation data structure: "+
+                            f"{self.config.data_structure.all.keys()}`. "
+                            "Make sure all needed data variables are defined."
+                        )
+                input_coords = {k:self.coordinates[k] for k in input_dims}
 
             else:
-                value = xr.DataArray(value.values, coords=input_coords)
+                input_dims = {
+                    k:v for k, v in reference_data.dims.items() 
+                    if k not in drop_dims
+                }
+                input_coords = {k:reference_data.coords[k] for k in input_dims}
+            
+            # this asserts that new dims is in the right order
+            new_dims = {
+                k: input_dims[k] for k in self.config.data_structure.all[key].dimensions
+                if k not in drop_dims
+            }
 
+            input_coords = {k: input_coords[k] for k in new_dims.keys()}
+
+            if isinstance(value, xr.DataArray):
+                value = value.values
+                if value.ndim != len(input_coords):
+                    raise KeyError(
+                        f"Dimensions of the input array ({value.ndim}) and " +
+                        "the specified dimensions on the data variable "+
+                        f"'{key}(dimensions={self.config.data_structure.all[key].dimensions})' " +
+                        "did not match. Is a dimension missing from "+
+                        "the data variable? You can update it by using"+
+                        f" `sim.config.data_structure.{key}.dimensions = [...]"
+                    )
+            else:
+                if len(new_dims) == 0:
+                    value = float(value)
+                else:
+                    value = np.broadcast_to(value, tuple(new_dims.values()))
+
+
+            value = xr.DataArray(value, coords=input_coords)
             input_dataset[key] = value
 
 
@@ -638,7 +1055,7 @@ class SimulationBase:
 
         display(widgets.HBox([widgets.VBox([s for _, s in sliders.items()]), out]))
     
-    def set_inferer(self, backend):
+    def set_inferer(self, backend: Literal["numpyro", "scipy", "pyabc", "pymoo"]):
         extra = (
             "set_inferer(backend='{0}') was not executed successfully, because "
             "'{0}' dependencies were not found. They can be installed with "
@@ -672,28 +1089,41 @@ class SimulationBase:
 
             self.inferer = NumpyroBackend(simulation=self)
     
+        elif backend == "scipy":
+            numpyro = import_optional_dependency(
+                "scipy", errors="raise", extra=extra.format("scipy")
+            )
+            if numpyro is not None:
+                from pymob.inference.scipy_backend import ScipyBackend
+
+            self.inferer = ScipyBackend(simulation=self)
+    
+    
+    
         else:
             raise NotImplementedError(f"Backend: {backend} is not implemented.")
 
-    def check_dimensions(self, dataset):
+    def check_dimensions(self, dataarray):
         """Check if dataset dimensions match the specified dimensions.
         TODO: Name datasets for referencing them in errormessages
         """
-        ds_dims = list(dataset.dims.keys())
-        in_dims = [k in self.dimensions for k in ds_dims]
+        ds_dims = dataarray.dims
+        specified_dims = self.config.data_structure[dataarray.name].dimensions
+        in_dims = [k in specified_dims for k in ds_dims]
         assert all(in_dims), IndexError(
             "Not all dataset dimensions, were not found in specified dimensions. "
-            f"Settings(dims={self.dimensions}) != dataset(dims={ds_dims})"
+            f"Settings(dims={specified_dims}) != dataset(dims={ds_dims})"
         )
         
-    def dataset_to_2Darray(self, dataset: xr.Dataset) -> xr.DataArray: 
-        self.check_dimensions(dataset=dataset)
-        array_2D = dataset.stack(multiindex=self.config.data_structure.dimensions)
-        return array_2D.to_array().transpose("multiindex", "variable")
+    def dataarray_to_1Darrayy(self, dataarray: xr.DataArray) -> xr.DataArray: 
+        self.check_dimensions(dataarray=dataarray)
+        arr_dims = self.config.data_structure[dataarray.name].dimensions
+        array_1D = dataarray.stack(multiindex=arr_dims)
+        return array_1D
 
-    def array2D_to_dataset(self, dataarray: xr.DataArray) -> xr.Dataset: 
-        dataset_2D = dataarray.to_dataset(dim="variable")      
-        return dataset_2D.unstack().transpose(*self.config.data_structure.dimensions)
+    def array1D_to_dataarray(self, dataarray: xr.DataArray) -> xr.DataArray: 
+        arr_dims = self.config.data_structure[dataarray.name].dimensions
+        return dataarray.unstack().transpose(*arr_dims)
 
     def create_data_scaler(self):
         """Creates a scaler for the data variables of the dataset over all
@@ -703,37 +1133,43 @@ class SimulationBase:
         # make sure the dataset follows the order of variables specified in
         # the config file. This is important so also in the simulation results
         # the scalers are matched.
-        ordered_dataset = self.observations[self.config.data_structure.data_variables]
-        obs_2D_array = self.dataset_to_2Darray(dataset=ordered_dataset)
-        # scaler = StandardScaler()
-        scaler = MinMaxScaler()
         
-        # add bounds to array of observations and fit scaler
-        lower_bounds = np.array(self.config.data_structure.data_variables_min)
-        upper_bounds = np.array(self.config.data_structure.data_variables_max)
-        stacked_array = np.row_stack([lower_bounds, upper_bounds, obs_2D_array])
-        scaler.fit(stacked_array)
+        for key in self.config.data_structure.observed_data_variables:
+            obs_1D_array = self.dataarray_to_1Darrayy(dataarray=self.observations[key])
 
-        self.scaler = scaler
+            # scaler = StandardScaler()
+            scaler = MinMaxScaler()
+            
+            # add bounds to array of observations and fit scaler
+            lower_bound = np.array(self.config.data_structure[key].min, ndmin=1)
+            upper_bound = np.array(self.config.data_structure[key].max, ndmin=1)
+            stacked_array = np.concatenate([lower_bound, upper_bound, obs_1D_array])
+            scaler.fit(stacked_array.reshape((len(stacked_array), -1)))
+
+            self._scaler.update({key: scaler})
+
         self.print_scaling_info()
 
         scaled_obs = self.scale_(self.observations)
         self.observations_scaled = scaled_obs
 
     def print_scaling_info(self):
-        scaler = type(self.scaler).__name__
-        for i, var in enumerate(self.config.data_structure.data_variables):
+        for key in self.config.data_structure.observed_data_variables:
+            scaler = self._scaler[key]
             print(
-                f"{scaler}(variable={var}, "
-                f"min={self.scaler.data_min_[i]}, max={self.scaler.data_max_[i]})"
+                f"{type(scaler).__name__}(variable={key}, "
+                f"min={scaler.data_min_[0]}, max={scaler.data_max_[0]})"
             )
 
     def scale_(self, dataset: xr.Dataset):
-        ordered_dataset = dataset[self.config.data_structure.data_variables]
-        data_2D_array = self.dataset_to_2Darray(dataset=ordered_dataset)
-        obs_2D_array_scaled = data_2D_array.copy() 
-        obs_2D_array_scaled.values = self.scaler.transform(data_2D_array) # type: ignore
-        return self.array2D_to_dataset(obs_2D_array_scaled)
+        obs_scaled = dataset.copy()
+        for key in self.config.data_structure.observed_data_variables:
+            obs_1D_array = self.dataarray_to_1Darrayy(dataarray=obs_scaled[key])
+            x = obs_1D_array.values.reshape((len(obs_1D_array), -1))
+            x_scaled = self._scaler[key].transform(x) 
+            obs_1D_array.values = x_scaled.reshape((len(x_scaled)))
+            obs_scaled[key] = self.array1D_to_dataarray(obs_1D_array)
+        return obs_scaled
 
     @property
     def results(self):
@@ -752,6 +1188,7 @@ class SimulationBase:
                 Y=results, 
                 coordinates=self.coordinates,
                 data_structure=self.data_structure,
+                var_dim_mapper=self.var_dim_mapper
             )
         elif isinstance(results, np.ndarray):
             return create_dataset_from_numpy(
@@ -796,7 +1233,7 @@ class SimulationBase:
         """
         max_scaled = scaled_results.max()
         min_scaled = scaled_results.min()
-        if isinstance(self.scaler, MinMaxScaler):
+        if isinstance(self._scaler, MinMaxScaler):
             for varkey, varval in max_scaled.variables.items():
                 if varval > 2:
                     warnings.warn(
@@ -839,7 +1276,7 @@ class SimulationBase:
             )
 
     @staticmethod
-    def parameterize(free_parameters: Dict[str,float|str|int], model_parameters: Dict) -> dict:
+    def parameterize(free_parameters: Dict[str,float|str|int], model_parameters: Dict) -> Dict:
         """
         Optional. Set parameters and initial values of the model. 
         Must return a dictionary with the keys 'y0' and 'parameters'
@@ -915,8 +1352,56 @@ class SimulationBase:
         """
         initializes the simulation. Performs any extra work, not done in 
         parameterize or set_coordinates. 
+
+        Overwrite in a case study simulation if special tasks are necessary
         """
-        pass
+        warnings.warn(
+            "Using default initialize method, "+
+            "(load observations, define 'y0', define 'x_in'). "+
+            "This may be insufficient for more complex simulations.",
+            category=UserWarning
+        )
+
+        obs_path = os.path.join(self.data_path, self.config.case_study.observations)
+        if obs_path is not None:
+            if os.path.exists(obs_path):
+                self.observations = xr.load_dataset(obs_path)
+            else:
+                raise FileNotFoundError(
+                    "Observations could not be found under the following path: "+
+                    f"'{obs_path}'. Make sure it exists "+
+                    "('sim.config.case_study.observations')"
+                )
+        else:
+            warnings.warn(
+                "'sim.config.case_study.observations' is undefined",
+                category=UserWarning
+            )
+
+        if self.config.simulation.y0 is not None:
+            self.model_parameters["y0"] = self.parse_input(
+                input="y0", 
+                reference_data=self.observations,
+                drop_dims=[self.config.simulation.x_dimension]
+            )
+        else:
+            warnings.warn(
+                "'sim.config.simulation.y0' is undefined.",
+                category=UserWarning
+            )
+
+        if self.config.simulation.y0 is not None:
+            self.model_parameters["x_in"] = self.parse_input(
+                input="x_in", 
+                reference_data=self.observations,
+                drop_dims=[]
+            )
+        else:
+            warnings.warn(
+                "'sim.config.simulation.y0' is undefined.",
+                category=UserWarning
+            )
+
     
     def dump(self, results):
         pass
@@ -924,20 +1409,6 @@ class SimulationBase:
     
     def plot(self, results):
         pass
-
-    def create_coordinates(self, coordinate_data):
-        if not isinstance(coordinate_data, (list, tuple)):
-            coordinate_data = (coordinate_data, )
-
-        assert len(self.config.data_structure.dimensions) == len(coordinate_data), errormsg(
-            f"""number of dimensions, specified in the configuration file
-            must match the coordinate data (X) returned by the `run` method.
-            """
-        )
-
-        coord_zipper = zip(self.config.data_structure.dimensions, coordinate_data)
-        coords = {dim: x_i for dim, x_i in coord_zipper}
-        return coords
 
     @staticmethod
     def create_dataset_from_numpy(Y, Y_names, coordinates):
@@ -1161,6 +1632,106 @@ class SimulationBase:
     def data_structure(self):
         return self.config.data_structure.dimdict
 
+    @property
+    def data_structure_and_dimensionality(self):
+        data_structure = {}
+        for dv, dv_dims in self.config.data_structure.dimdict.items():
+            dim_sizes = {}
+            for dim in dv_dims:
+                coord = self.coordinates[dim]
+                dim_sizes.update({dim: len(coord)})
+            data_structure.update({dv: dim_sizes})
+
+        return data_structure
+
+    @property
+    def dimension_coords(self) -> Dict[str, Tuple[str|int, ...]]:
+        """Goes through dimensions of data structure and adds coordinates,
+        then goes through dimensions of parameters and searches in coordinates
+        and indices to 
+        """
+        dim_coords = {}
+        for dim in self.config.data_structure.dimensions:
+            try:
+                coord = self.coordinates[dim]   
+            except KeyError:
+                raise KeyError(
+                    f"'{dim}' was specified in config.data_structure but is not "+
+                    f"available in sim.coordinates['{dim}']. Provide observations "+
+                    "that have coordinates specified for this dimension, or, "+
+                    "if the dimension is unneeded, remove it from the definition "+
+                    "of the data variable."
+                )
+            dim_coords.update({dim: tuple(coord)})
+
+        for dim in self.config.model_parameters.dimensions:
+            coord = self.coordinates.get(dim, None)
+
+            if coord is None:
+                coord = self.coordinates_indices.get(dim, None)
+            
+            if coord is None:
+                raise KeyError(
+                    f"No coordinates have been defined for parameter dimension "+
+                    f"{dim}. Use `sim.coordinates['{dim}'] = [...]` to define "+
+                    "the coordinates." 
+                )
+            
+            _, index = np.unique(coord, return_index=True)
+            unique_coords = tuple(np.array(coord)[sorted(index)])
+
+            if dim in dim_coords and unique_coords != dim_coords[dim]:
+                raise ValueError(
+                    "unique coordinates in sim.indices were not identical to "+
+                    f"simulation coordinates of dimension '{dim}'"
+                )
+
+            dim_coords.update({dim: unique_coords})
+
+        return dim_coords
+    
+    @property
+    def dimension_sizes(self) -> Dict[str, int]:
+        return {
+            dim: len(coords) for dim, coords 
+            in self.dimension_coords.items()
+        }
+
+    @staticmethod
+    def index_coordinates(array):
+        # Create a dictionary to map unique coordinates to indices
+        # using np.unique thereby retains the order of the elements in
+        # the order of their furst occurence
+        # use an unsorted unique index
+        unique_coordinates, index = np.unique(array, return_index=True)
+        unique_coordinates = unique_coordinates[index.argsort()]
+        string_to_index = {
+            coord: index for index, coord 
+            in enumerate(unique_coordinates)
+        }
+
+        # Convert the original array to a list of indices
+        index_list = [string_to_index[string] for string in array]
+        return index_list
+
+    def create_index(self, coord):
+        if coord not in self.observations.coords:
+            raise KeyError(f"{coord} is not in {list(self.observations.coords)}")
+        
+        batch_dim = self.config.simulation.batch_dimension
+        # TODO: There may be a problem, when batch dimension is not defined!
+
+        return {coord: xr.DataArray(
+                self.index_coordinates(self.observations[coord].values),
+                dims=(batch_dim), 
+                coords={
+                    batch_dim: self.observations[batch_dim], 
+                    coord: self.observations[coord]
+                }, 
+                name=f"{coord}_index"
+            )
+        }
+
     def reorder_dims(self, Y):
         results = {}
         for var, mapper in self.var_dim_mapper.items():
@@ -1169,3 +1740,46 @@ class SimulationBase:
             })
     
         return results
+
+    def prior_predictive_checks(self):
+        """OVERWRITE IF NEEDED.
+        Placeholder method. Minimally plots the prior predictions of a 
+        simulation.
+        """
+
+        idata = self.inferer.prior_predictions()
+
+        checks = {}
+        flag = self.inferer.check_prior_for_nans(idata=idata)
+        checks.update({"NaN values in prior draws": flag})
+
+        if not all(checks.values()):
+            raise ValueError("Not all checks passed.")
+
+        simplot = self.SimulationPlot(
+            observations=self.observations,
+            idata=idata,
+            coordinates=self.dimension_coords,
+            config=self.config,
+            idata_groups=["prior_predictive"],
+        )   
+
+        simplot.plot_data_variables()
+        simplot.save("prior_predictive.png")
+
+    def posterior_predictive_checks(self):
+        """OVERWRITE IF NEEDED.
+        Placeholder method. Minimally plots the posterior predictions of a 
+        simulation.
+        """
+
+        simplot = self.SimulationPlot(
+            observations=self.observations,
+            idata=self.inferer.idata,
+            coordinates=self.dimension_coords,
+            config=self.config,
+            idata_groups=["posterior_predictive"],
+        )
+
+        simplot.plot_data_variables()
+        simplot.save("posterior_predictive.png")

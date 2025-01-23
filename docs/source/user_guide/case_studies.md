@@ -5,14 +5,14 @@ Case studies are a principled approach to the *modelling* process. In essence, t
 Each case study consists of the following components:
 
 ```
-test_case_study
+lotka_volterra_case_study
   sim.py               # sets up the simulation
   mod.py               # (opt) outsources solver and model definitions
   data.py              # (opt) outsources data input
   plot.py              # (opt) outsources vizualizations
 
   scenarios
-    scenario_A         # the scenario of the "test_case_study" 
+    scenario_A         # the scenario of the "lotka_volterra_case_study" 
       settings.cfg     # configuration for the case study and scenario
       simulation.cfg   # parameters of the simulation
 
@@ -40,7 +40,7 @@ Since `pymob-0.4.0` configurations can be specified in the scripting API and exp
 
 ```conf
 [case-study]
-name = test_case_study
+name = lotka_volterra_case_study
 scenario = test_scenario
 package = case_studies
 modules = sim mod prob data plot

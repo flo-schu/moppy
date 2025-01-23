@@ -3,6 +3,7 @@ import warnings
 import numpy as np
 import xarray as xr
 import arviz as az
+from arviz.sel_utils import xarray_var_iter
 from matplotlib import pyplot as plt
 import matplotlib as mpl
 
@@ -231,6 +232,9 @@ def create_table(posterior, error_metric="hdi", vars={}, nesting_dimension=None)
 
         return formatted_tab
     
+    else:
+        raise NotImplementedError("Must use one of 'sd' or 'hdi'")
+    
 
 def filter_not_converged_chains(idata, deviation=1.05):
     posterior = idata.posterior
@@ -408,3 +412,82 @@ def evaluate_posterior(sim, nesting_dimension, n_samples=10_000, vars_table={},
             plt.show()
         else:
             plt.close()
+
+
+
+def plot_pair(posterior, likelihood, parameters, axes=None):
+
+    likelihood_vars = list(likelihood.data_vars.keys())
+    N = len(likelihood_vars)
+
+    if axes is None:
+        fig, axes = plt.subplots(1, N, figsize=(3+(2*(N-1)), 3), sharey=True, sharex=True)
+    
+    if isinstance(likelihood, xr.DataArray):
+        if likelihood.name is None:
+            likelihood.name = "joint_likelihood"
+        likelihood = likelihood.to_dataset()
+    
+
+    par_a, par_b = parameters
+
+    post_a = posterior[par_a]
+    post_b = posterior[par_b]
+
+    # always put the smaller parameter on the x-axis
+    if post_a.ndim <= post_b.ndim:
+        post_x = post_a
+        post_y = post_b
+    else:
+        post_x = post_b.stack(sample=("chain", "draw"))
+        post_y = post_a.stack(sample=("chain", "draw"))
+
+    loglik = likelihood.stack(sample=("chain","draw"))
+    extra_dims_y = [d for d in post_y.dims if d not in post_x.dims]
+    norm = mpl.colors.Normalize(vmin=(likelihood).to_array().min(), vmax=(likelihood).to_array().max())
+    cmap = mpl.colormaps["plasma"]
+
+    for likvar, ax in zip(likelihood_vars, axes):
+        ll = loglik[likvar]
+        ax.set_title(likvar)
+        ax.set_xlabel(post_x.name)
+        ax.set_ylabel(post_y.name)
+        for dim in extra_dims_y:
+            for coord in post_y.coords[dim].values:
+                if dim in ll.dims:
+                    ll_coord = ll.sel({dim:coord})
+                else:
+                    ll_coord = ll
+
+                scatter = ax.scatter(
+                    post_x, 
+                    post_y.sel({dim:coord}), 
+                    c=ll_coord, 
+                    alpha=0.25,
+                    marker=f"${coord}$",
+                    s=40,
+                    cmap=cmap,
+                    norm=norm
+                )
+
+                # ax.annotate()
+        
+    cbar = fig.colorbar(
+        mappable=mpl.cm.ScalarMappable(norm=norm, cmap=cmap), 
+        # if the same axis is used it is plot next to
+        # the plot depending on the location option
+        # ax=ax,
+        # location="right",
+        orientation="vertical",
+
+        # if another axis is used, the fraction should be increased to 1.0
+        ax=ax,
+        fraction=0.1,
+        pad=0.05,
+        # aspect=20, # parameter is not so important. It thins the colorbar
+        label="negative log-likelihood"
+    )
+    fig.tight_layout()
+
+    # ax_colorbar = gs[:,N].subgridspec(1, 1).subplots()
+    return fig

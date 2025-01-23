@@ -13,16 +13,17 @@ from matplotlib import pyplot as plt
 from pymob.simulation import SimulationBase
 from pymob.utils.store_file import is_number
 from pymob.utils.errors import import_optional_dependency
+from pymob.inference.base import InferenceBackend
 
 import pyabc
 from pathos import multiprocessing as mp
 
-class PyabcBackend:
-    idata = az.InferenceData
+class PyabcBackend(InferenceBackend):
     def __init__(
         self, 
         simulation: SimulationBase
     ):
+        super().__init__(simulation=simulation)
         self.parameter_map = {}
         
         self.simulation = simulation
@@ -36,15 +37,7 @@ class PyabcBackend:
         self.history = None
         self.posterior = None
         self.config = simulation.config
-
-
-    @property
-    def extra_vars(self):
-        # TODO: Remove when all methods have been changed
-        warnings.warn("Deprecation warning. Use `Simulation.config.OPTION` API")
-        return self.config.inference.extra_vars
-    
-    
+   
     @property
     def sampler(self):
         # TODO: Remove when all methods have been changed

@@ -4,13 +4,13 @@ pymob.inference package
 Submodules
 ----------
 
-pymob.inference.interactive module
-----------------------------------
+.. pymob.inference.interactive module
+.. ----------------------------------
 
-.. automodule:: pymob.inference.interactive
-   :members:
-   :undoc-members:
-   :show-inheritance:
+.. .. automodule:: pymob.inference.interactive
+..    :members:
+..    :undoc-members:
+..    :show-inheritance:
 
 pymob.inference.numpyro\_backend module
 ---------------------------------------
@@ -20,21 +20,21 @@ pymob.inference.numpyro\_backend module
    :undoc-members:
    :show-inheritance:
 
-pymob.inference.optimization module
------------------------------------
+.. pymob.inference.optimization module
+.. -----------------------------------
 
-.. automodule:: pymob.inference.optimization
-   :members:
-   :undoc-members:
-   :show-inheritance:
+.. .. automodule:: pymob.inference.optimization
+..    :members:
+..    :undoc-members:
+..    :show-inheritance:
 
-pymob.inference.optimize\_indy module
--------------------------------------
+.. pymob.inference.optimize\_indy module
+.. -------------------------------------
 
-.. automodule:: pymob.inference.optimize_indy
-   :members:
-   :undoc-members:
-   :show-inheritance:
+.. .. automodule:: pymob.inference.optimize_indy
+..    :members:
+..    :undoc-members:
+..    :show-inheritance:
 
 pymob.inference.pyabc\_backend module
 -------------------------------------

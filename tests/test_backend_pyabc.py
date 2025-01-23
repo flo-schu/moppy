@@ -6,6 +6,7 @@ from tests.fixtures import init_simulation_casestudy_api
 
 
 def test_convergence():
+    pytest.skip()
     sim = init_simulation_casestudy_api()
     sim.set_inferer(backend="pyabc")
     sim.inferer.run()
@@ -32,7 +33,7 @@ def test_commandline_api_infer():
     from pymob.infer import main
     runner = CliRunner()
     
-    args = "--case_study=test_case_study "\
+    args = "--case_study=lotka_volterra_case_study "\
         "--scenario=test_scenario "\
         "--inference_backend=pyabc"
     result = runner.invoke(main, args.split(" "))

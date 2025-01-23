@@ -5,7 +5,7 @@ from pymob.sim.config import Config
 from pymob.utils import help
 
 @click.command()
-@click.option("-c", "--case_study", type=str, default="test_case_study", 
+@click.option("-c", "--case_study", type=str, default="lotka_volterra_case_study", 
               help=help.case_study)
 @click.option("-s", "--scenario", type=str, default="test_scenario", 
               help=help.scenario)
@@ -19,7 +19,7 @@ def main(case_study, scenario, package, logging, logfile):
     config = Config(cfg)
     config.case_study.name = case_study
     config.case_study.scenario = scenario
-    config.import_casestudy_modules()
+    config.import_casestudy_modules(reset_path=True)
 
     # update parameters from config file if they are specified
     if logging is not None: config.case_study.logging = logging

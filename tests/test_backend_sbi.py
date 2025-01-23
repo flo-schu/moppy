@@ -98,7 +98,7 @@ def test_commandline_api_infer():
     from pymob.infer import main
     runner = CliRunner()
     
-    args = "--case_study=test_case_study "\
+    args = "--case_study=lotka_volterra_case_study "\
         "--scenario=test_scenario "\
         "--inference_backend=sbi"
     result = runner.invoke(main, args.split(" "))
