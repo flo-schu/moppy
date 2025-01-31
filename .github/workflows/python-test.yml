@@ -42,7 +42,11 @@ jobs:
           echo "Github head_ref ${{ github.head_ref }}"
           echo "GitHub ref_type: ${{ github.ref_type }}"
           echo "GitHub ref_name: ${{ github.ref_name }}"
-          branch=$(git branch -r --contains ${{ github.ref }} --format "%(refname:lstrip=3)")
+          commit=$(git rev-parse HEAD)
+          echo "Commit ID of HEAD: ${commit}"
+          msg=$(git log -1 --pretty=format:"%s")
+          echo "Last Commit message: ${msg}"
+          branch=$(git branch -r --contains $commit --format "%(refname:lstrip=3)")
           echo "scripted branch: ${branch}"
           echo "GitHub base branch of tag: ${{ github.event.base_ref }}"
           echo "GitHub sha: ${{ github.sha }}"
@@ -65,17 +69,19 @@ jobs:
         python-version: ["3.10", "3.11"]
 
     steps:
-    - name: Check if commit message contains "bump version"
-      id: check_commit
-      run: |
-        if [[ "${{ github.event.head_commit.message }}" =~ ^bump\ version\ [0-9]+\.[0-9]+\.[0-9]+[a-zA-Z]?[0-9]+\ -\>\ [0-9]+\.[0-9]+\.[0-9]+?[a-zA-Z]?[0-9]+$ ]]; then
-          echo "skip=true" >> $GITHUB_ENV
-        fi
-
     - uses: actions/checkout@v4
       if: env.skip != 'true'
       with:
         submodules: true
+
+    - name: Check if commit message contains "bump version"
+      id: check_commit
+      run: |
+        msg=$(git log -1 --pretty=format:"%s")
+        echo "Commit message ${msg}"
+        if [[ "${msg}" =~ ^bump\ version\ [0-9]+\.[0-9]+\.[0-9]+[a-zA-Z]?[0-9]+\ -\>\ [0-9]+\.[0-9]+\.[0-9]+?[a-zA-Z]?[0-9]+$ ]]; then
+          echo "skip=true" >> $GITHUB_ENV
+        fi
 
     - name: Set up Python ${{ matrix.python-version }}
       if: env.skip != 'true'

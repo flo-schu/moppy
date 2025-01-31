@@ -19,11 +19,26 @@ from matplotlib import pyplot as plt
 import matplotlib as mpl
 import arviz as az
 import itertools as it
+import tqdm
 
 from pymob.simulation import SimulationBase
 from pymob.sim.parameters import Param, RandomVariable, Expression
 from pymob.sim.config import Datastructure
 from pymob.utils.config import lookup_from
+
+import logging
+
+class TqdmLogger:
+    """File-like class redirecting tqdm progress bar to given logging logger."""
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+
+    def write(self, msg: str) -> None:
+        self.logger.info(msg.lstrip("\r"))
+
+    def flush(self) -> None:
+        pass
+
 
 class Errorfunction(Protocol):
     def __call__(
@@ -327,6 +342,7 @@ class InferenceBackend(ABC):
         bounds: Tuple[List[float],List[float]] = ([-10, 10], [-10,10]),
         n_grid_points: int = 100,
         n_vector_points: int = 50,
+        normal_base = False,
         ax: Optional[plt.Axes] = None,
     ):
         """Plots the likelihood for each coordinate pair of two model parameters
@@ -371,8 +387,24 @@ class InferenceBackend(ABC):
         x = np.linspace(*bounds_x, n_grid_points)
         y = np.linspace(*bounds_y, n_grid_points)
 
-        grid = {p: v for p, v in zip(parameters, np.array(list(it.product(x, y))).T)}
-        loglik = log_likelihood_func(grid)
+        normal_base_str = "_normal_base" if normal_base else ""
+
+        grid = {
+            f"{p}{normal_base_str}": np.expand_dims(v, 1) for p, v 
+            in zip(parameters, np.array(list(it.product(x, y))).T)
+        }
+
+        loglik = []
+        for i in tqdm.tqdm(
+            range(len(x) * len(y)), 
+            desc="Function evaluations", 
+            mininterval=5,
+            file=TqdmLogger(self.simulation.logger)
+        ):
+            loglik_i = log_likelihood_func({k: v[i] for k, v in grid.items()})
+            loglik.append(loglik_i)
+
+        loglik = np.array(loglik)
 
         # loglikelihood must be transposed to work with meshgrid
         Z = loglik.reshape((n_grid_points, n_grid_points)).T
@@ -389,11 +421,25 @@ class InferenceBackend(ABC):
             yv = np.linspace(*bounds_y, n_vector_points)
             Xv, Yv = np.meshgrid(xv, yv)
 
-            gridv = {p: v for p, v in zip(parameters, np.array(list(it.product(xv, yv))).T)}
+            gridv = {
+                f"{p}{normal_base_str}": np.expand_dims(v, 1) for p, v 
+                in zip(parameters, np.array(list(it.product(xv, yv))).T)
+            }
 
-            grads = gradient_func(gridv)
+            u = []
+            v = []
+            for i in tqdm.tqdm(
+                range(len(xv) * len(yv)), 
+                desc="Gradient evaluations", 
+                mininterval=5,
+                file=TqdmLogger(self.simulation.logger)
+            ):
+                grads = gradient_func({k: v[i] for k, v in gridv.items()})
+                u.append(grads[f"{par_x}{normal_base_str}"])
+                v.append(grads[f"{par_y}{normal_base_str}"])
 
-            u, v = grads[par_x], grads[par_y]
+            u = np.array(u)
+            v = np.array(v)
 
             # gradients must be transposed to work with meshgrid
             U = u.reshape((n_vector_points, n_vector_points)).T
@@ -619,6 +665,10 @@ class InferenceBackend(ABC):
             if v.prior.distribution != "deterministic"
         ]
 
+        if hasattr(self.idata, "sample_stats"):
+            if "diverging" in self.idata["sample_stats"]:
+                self.idata["sample_stats"]["diverging"] = self.idata["sample_stats"].diverging.astype(int)
+
         if hasattr(self.idata, "posterior"):
             axes = az.plot_trace(
                 self.idata,
@@ -653,3 +703,4 @@ class InferenceBackend(ABC):
             return False
         else:
             return True
+      

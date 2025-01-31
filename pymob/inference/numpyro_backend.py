@@ -864,18 +864,18 @@ class NumpyroBackend(InferenceBackend):
                 return custom_return_fn(joint_log_density, prior_loglik, data_loglik)
 
             prior_loglik_sum = {
-                key: np.sum(value) for key, value in prior_loglik.items()
+                key: jnp.sum(value) for key, value in prior_loglik.items()
             }
 
             data_loglik_sum = {
-                key: np.sum(value) for key, value in data_loglik.items()
+                key: jnp.sum(value) for key, value in data_loglik.items()
             }
 
             if return_type == "summed-by-site":
                 return joint_log_density, prior_loglik_sum, data_loglik_sum
 
-            prior_loglik_total = np.sum(list(prior_loglik_sum.values()))
-            data_loglik_total = np.sum(list(data_loglik_sum.values()))
+            prior_loglik_total = jnp.sum(jnp.array(list(prior_loglik_sum.values())))
+            data_loglik_total = jnp.sum(jnp.array(list(data_loglik_sum.values())))
             
             if return_type == "summed-by-prior-data":
                 return joint_log_density, prior_loglik_total, data_loglik_total
@@ -1018,6 +1018,13 @@ class NumpyroBackend(InferenceBackend):
                 # TODO: Use trace handler to obtain the different components
                 #       prior, likelihood and deterministic transforms to populate
                 #       missing components
+                if f"{data_var}_obs" not in predictions:
+                    raise KeyError(
+                        f"`{data_var}` was not found in the predictions, "+
+                        "but is marked as an observed data variable. Either "+
+                        f"set `sim.config.data_variables.{data_var}.observed = False` " +
+                        f"or generate predictions for '{data_var}' in the error-model."
+                    )
                 obs = predictions[f"{data_var}_obs"]
             else:
                 if self.error_model[data_var].obs_transform_func is not None:
